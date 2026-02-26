@@ -1,25 +1,27 @@
 services:
   polymarket_collector:
-    image: ghcr.io/${GITHUB_REPOSITORY:-edy/poly-valid-price}:latest
+    image: ghcr.io/wanglz111/poly-valid-price:latest
     container_name: polymarket_collector
     restart: unless-stopped
+    pull_policy: always
     env_file:
       - .env
     environment:
       MYSQL_HOST: db
-    command: ["/app/fetch_polymarket_prices.py"]
+    entrypoint: ["python", "/app/fetch_polymarket_prices.py"]
     networks:
       - backend
 
   chainlink_collector:
-    image: ghcr.io/${GITHUB_REPOSITORY:-edy/poly-valid-price}:latest
+    image: ghcr.io/wanglz111/poly-valid-price:latest
     container_name: chainlink_collector
     restart: unless-stopped
+    pull_policy: always
     env_file:
       - .env
     environment:
       MYSQL_HOST: db
-    command: ["/app/fetch_chainlink_reports.py"]
+    entrypoint: ["python", "/app/fetch_chainlink_reports.py"]
     networks:
       - backend
 
