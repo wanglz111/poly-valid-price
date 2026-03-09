@@ -9,12 +9,15 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from table_naming import TableNameResolver, parse_bool_flag, parse_timezone_offset
+
 DEFAULT_TABLE = "chainlink_live_reports"
 DEFAULT_WINDOWS_TABLE = "chainlink_5m_windows"
 BASE_URL = "https://data.chain.link/api/query-timescale"
 QUERY_NAME = "LIVE_STREAM_REPORTS_QUERY"
 DEFAULT_INTERVAL_SECONDS = 15
 TZ_UTC8 = timezone(timedelta(hours=8))
+DEFAULT_TABLE_DATE_TZ = "+08:00"
 
 
 def load_dotenv(path: str = ".env") -> None:
@@ -228,6 +231,25 @@ def insert_reports(conn, reports_table: str, rows):
         return cur.rowcount
 
 
+def insert_reports_grouped(conn, reports_base_table: str, windows_base_table: str, rows, table_resolver):
+    if not rows:
+        return 0, set()
+
+    grouped_rows = {}
+    touched_table_pairs = set()
+    for row in rows:
+        reports_table = table_resolver.resolve(reports_base_table, row["ts_unix"])
+        windows_table = table_resolver.resolve(windows_base_table, row["start_at"])
+        grouped_rows.setdefault((reports_table, windows_table), []).append(row)
+        touched_table_pairs.add((reports_table, windows_table))
+
+    total_inserted = 0
+    for reports_table, windows_table in grouped_rows:
+        ensure_tables(conn, reports_table, windows_table)
+        total_inserted += insert_reports(conn, reports_table, grouped_rows[(reports_table, windows_table)])
+    return total_inserted, touched_table_pairs
+
+
 def refresh_windows(conn, reports_table: str, windows_table: str):
     sql = f"""
     INSERT INTO `{windows_table}` (
@@ -316,10 +338,11 @@ def connect_mysql(args):
     )
 
 
-def run_cycle(conn, feeds, args):
+def run_cycle(conn, feeds, args, table_resolver):
     total_inserted = 0
     total_seen = 0
     now_utc8 = datetime.now(TZ_UTC8).strftime("%Y-%m-%d %H:%M:%S")
+    cycle_touched_table_pairs = set()
 
     for symbol, feed_id in feeds.items():
         url = build_url(feed_id)
@@ -337,15 +360,22 @@ def run_cycle(conn, feeds, args):
                 parsed_rows.append(row)
 
         total_seen += len(parsed_rows)
-        inserted = insert_reports(conn, args.mysql_table, parsed_rows)
+        inserted, touched_table_pairs = insert_reports_grouped(
+            conn,
+            args.mysql_table,
+            args.mysql_windows_table,
+            parsed_rows,
+            table_resolver,
+        )
         total_inserted += inserted
+        cycle_touched_table_pairs.update(touched_table_pairs)
         latest_ts = parsed_rows[0]["ts_unix"] if parsed_rows else None
         print(
             f"[{now_utc8} UTC+8] [{symbol}] fetched={len(parsed_rows)} inserted={inserted} "
             f"latest_ts={latest_ts} latest_utc8={ts_to_utc8_str(latest_ts)}"
         )
-
-    refresh_windows(conn, args.mysql_table, args.mysql_windows_table)
+    for reports_table, windows_table in cycle_touched_table_pairs:
+        refresh_windows(conn, reports_table, windows_table)
     conn.commit()
     print(f"[{now_utc8} UTC+8] cycle_summary: seen={total_seen} inserted={total_inserted}")
 
@@ -366,10 +396,17 @@ def parse_args():
     parser.add_argument("--mysql-password", default=os.getenv("MYSQL_PASSWORD", ""))
     parser.add_argument("--mysql-table", default=os.getenv("MYSQL_TABLE", DEFAULT_TABLE))
     parser.add_argument("--mysql-windows-table", default=os.getenv("MYSQL_WINDOWS_TABLE", DEFAULT_WINDOWS_TABLE))
+    parser.add_argument("--mysql-daily-tables", default=os.getenv("MYSQL_DAILY_TABLES", "1"))
+    parser.add_argument("--mysql-table-date-tz", default=os.getenv("MYSQL_TABLE_DATE_TZ", DEFAULT_TABLE_DATE_TZ))
 
     args = parser.parse_args()
     if not args.mysql_database or not args.mysql_user:
         parser.error("MYSQL_DATABASE and MYSQL_USER are required (set in .env or CLI args)")
+    try:
+        args.mysql_daily_tables = parse_bool_flag(args.mysql_daily_tables)
+        args.mysql_table_timezone = parse_timezone_offset(args.mysql_table_date_tz)
+    except ValueError as exc:
+        parser.error(str(exc))
     return args
 
 
@@ -381,25 +418,36 @@ def main():
         print(str(e), file=sys.stderr)
         sys.exit(1)
 
+    table_resolver = TableNameResolver(
+        daily_enabled=args.mysql_daily_tables,
+        table_timezone=args.mysql_table_timezone,
+    )
     conn = connect_mysql(args)
     try:
-        ensure_tables(conn, args.mysql_table, args.mysql_windows_table)
+        now_ts = int(time.time())
+        active_reports_table = table_resolver.resolve(args.mysql_table, now_ts)
+        active_windows_table = table_resolver.resolve(args.mysql_windows_table, now_ts)
+        ensure_tables(conn, active_reports_table, active_windows_table)
         conn.commit()
 
         print("feeds:")
         for symbol, feed_id in feeds.items():
             print(f"  {symbol}: {feed_id}")
         print(f"interval_seconds: {args.interval_seconds}")
-        print(f"reports_table: {args.mysql_table}")
-        print(f"windows_table: {args.mysql_windows_table}")
+        print(f"reports_table_base: {args.mysql_table}")
+        print(f"windows_table_base: {args.mysql_windows_table}")
+        print(f"table_daily_split: {args.mysql_daily_tables}")
+        print(f"table_date_tz: {args.mysql_table_date_tz}")
+        print(f"active_reports_table: {active_reports_table}")
+        print(f"active_windows_table: {active_windows_table}")
 
         if args.once:
-            run_cycle(conn, feeds, args)
+            run_cycle(conn, feeds, args, table_resolver)
             return
 
         while True:
             started = time.time()
-            run_cycle(conn, feeds, args)
+            run_cycle(conn, feeds, args, table_resolver)
             elapsed = time.time() - started
             sleep_for = max(0.0, args.interval_seconds - elapsed)
             if sleep_for > 0:

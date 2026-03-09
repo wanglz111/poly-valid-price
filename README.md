@@ -4,6 +4,13 @@
 - Chainlink Streams（ETH/BTC/SOL）
 - Polymarket 5m 市场 Up 买价（ETH/BTC/SOL）
 
+当前默认按天分表，表名规则如下：
+- `polymarket_prices_YYYYMMDD`
+- `chainlink_live_reports_YYYYMMDD`
+- `chainlink_5m_windows_YYYYMMDD`
+
+默认按 `+08:00` 时区切天，可通过环境变量调整。
+
 ## 项目文件
 - `fetch_chainlink_reports.py`: Chainlink 价格采集并入库 MySQL
 - `fetch_polymarket_prices.py`: Polymarket 价格采集并入库 MySQL（每秒写入）
@@ -20,6 +27,8 @@ cp .env.example .env
 注意：
 - `docker-compose.yml` 已强制 `MYSQL_HOST=db`
 - 外部网络固定为 `poly_backend`
+- `MYSQL_DAILY_TABLES=1` 时启用按天分表（默认开启）
+- `MYSQL_TABLE_DATE_TZ=+08:00` 控制分表日期使用的时区
 
 ## 本地运行（Python）
 安装依赖：

@@ -10,12 +10,14 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 
 import pymysql
+from table_naming import TableNameResolver, parse_bool_flag, parse_timezone_offset
 
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 CLOB_BASE = "https://clob.polymarket.com"
 DEFAULT_TABLE = "polymarket_prices"
 SYMBOLS_DEFAULT = "btc,eth,sol"
 CHAINLINK_UNIT_SCALE = 10**18
+DEFAULT_TABLE_DATE_TZ = "+08:00"
 
 
 def load_dotenv(path: str = ".env") -> None:
@@ -174,19 +176,35 @@ def parse_args():
     p.add_argument("--mysql-user", default=os.getenv("MYSQL_USER", ""))
     p.add_argument("--mysql-password", default=os.getenv("MYSQL_PASSWORD", ""))
     p.add_argument("--mysql-table", default=os.getenv("POLYMARKET_TABLE", DEFAULT_TABLE))
+    p.add_argument("--mysql-daily-tables", default=os.getenv("MYSQL_DAILY_TABLES", "1"))
+    p.add_argument("--mysql-table-date-tz", default=os.getenv("MYSQL_TABLE_DATE_TZ", DEFAULT_TABLE_DATE_TZ))
 
     args = p.parse_args()
     if not args.mysql_database or not args.mysql_user or not args.mysql_password:
         p.error("MYSQL_DATABASE / MYSQL_USER / MYSQL_PASSWORD are required")
+    try:
+        args.mysql_daily_tables = parse_bool_flag(args.mysql_daily_tables)
+        args.mysql_table_timezone = parse_timezone_offset(args.mysql_table_date_tz)
+    except ValueError as exc:
+        p.error(str(exc))
     return args
 
 
 def main():
     args = parse_args()
     symbols = [s.strip().lower() for s in args.symbols.split(",") if s.strip()]
+    table_resolver = TableNameResolver(
+        daily_enabled=args.mysql_daily_tables,
+        table_timezone=args.mysql_table_timezone,
+    )
 
     conn = mysql_connect(args)
-    ensure_table(conn, args.mysql_table)
+    current_table = table_resolver.resolve(args.mysql_table, int(time.time()))
+    ensure_table(conn, current_table)
+    print(f"table_base: {args.mysql_table}")
+    print(f"table_daily_split: {args.mysql_daily_tables}")
+    print(f"table_date_tz: {args.mysql_table_date_tz}")
+    print(f"active_table: {current_table}")
 
     state = {
         s: {
@@ -280,7 +298,12 @@ def main():
                     "up_buy_price_chainlink_unit_raw": to_chainlink_unit(st["last_price"]),
                     "chainlink_price_unit_scale": 18,
                 }
-                insert_row(conn, args.mysql_table, row)
+                target_table = table_resolver.resolve(args.mysql_table, ts)
+                if target_table != current_table:
+                    ensure_table(conn, target_table)
+                    current_table = target_table
+                    print(f"[table-switch] active_table={current_table}")
+                insert_row(conn, current_table, row)
                 inserted += 1
 
             minute_bucket = ts // 60
