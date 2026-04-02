@@ -362,7 +362,7 @@ class PolymarketWsTradeCollector:
             "type": "market",
         }
         ws.send(json.dumps(payload))
-        print(f"[ws] subscribed asset_count={len(asset_ids)} assets={','.join(asset_ids)}")
+        print(f"[ws] subscribed asset_count={len(asset_ids)}")
 
     def on_message(self, _ws, message: str):
         if message in {"PONG", "PING"}:
@@ -515,7 +515,7 @@ class PolymarketWsTradeCollector:
         payload = {"operation": operation, "assets_ids": asset_ids}
         try:
             app.send(json.dumps(payload))
-            print(f"[ws] {operation} asset_count={len(asset_ids)} assets={','.join(asset_ids)}")
+            print(f"[ws] {operation} asset_count={len(asset_ids)}")
         except Exception as exc:  # noqa: BLE001
             print(f"[ws] {operation} failed: {exc}")
 
