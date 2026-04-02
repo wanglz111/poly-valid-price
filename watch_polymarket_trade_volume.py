@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
 import signal
 import threading
 import time
@@ -11,12 +12,30 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
+import pymysql
 import websocket
 
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 WS_MARKET_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-SYMBOLS_DEFAULT = "doge,bnb,hype"
+SYMBOLS_DEFAULT = "doge,bnb,hype,eth,btc,sol"
 HEARTBEAT_INTERVAL_SECONDS = 10.0
+DEFAULT_TABLE = "polymarket_trade_volume_windows"
+
+
+def load_dotenv(path: str = ".env") -> None:
+    if not os.path.exists(path):
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if value and value[0] == value[-1] and value[0] in ('"', "'"):
+                value = value[1:-1]
+            os.environ.setdefault(key, value)
 
 
 def http_json(url: str, timeout: float = 0.8):
@@ -69,6 +88,78 @@ def format_window_label(window_start_ts: int) -> str:
     return f"{start_dt:%Y-%m-%d %H:%M:%S}Z -> {end_dt:%H:%M:%S}Z"
 
 
+def ensure_table(conn, table: str):
+    sql = f"""
+    CREATE TABLE IF NOT EXISTS `{table}` (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      window_start_ts BIGINT NOT NULL,
+      window_end_ts BIGINT NOT NULL,
+      symbol VARCHAR(16) NOT NULL,
+      market_slug VARCHAR(128) NOT NULL,
+      market_condition_id VARCHAR(128) NOT NULL,
+      outcome VARCHAR(16) NOT NULL,
+      asset_id VARCHAR(128) NOT NULL,
+      trade_count INT NOT NULL,
+      trade_size DECIMAL(30,18) NOT NULL,
+      trade_notional DECIMAL(30,18) NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_window_symbol_outcome (window_start_ts, symbol, outcome),
+      KEY idx_symbol_window (symbol, window_start_ts),
+      KEY idx_market_window (market_slug, window_start_ts),
+      KEY idx_asset_window (asset_id, window_start_ts)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql)
+
+
+def upsert_rows(conn, table: str, rows: list[dict]) -> int:
+    if not rows:
+        return 0
+    sql = f"""
+    INSERT INTO `{table}` (
+      window_start_ts,
+      window_end_ts,
+      symbol,
+      market_slug,
+      market_condition_id,
+      outcome,
+      asset_id,
+      trade_count,
+      trade_size,
+      trade_notional
+    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    ON DUPLICATE KEY UPDATE
+      window_end_ts = VALUES(window_end_ts),
+      market_slug = VALUES(market_slug),
+      market_condition_id = VALUES(market_condition_id),
+      asset_id = VALUES(asset_id),
+      trade_count = VALUES(trade_count),
+      trade_size = VALUES(trade_size),
+      trade_notional = VALUES(trade_notional)
+    """
+    params = [
+        (
+            row["window_start_ts"],
+            row["window_end_ts"],
+            row["symbol"],
+            row["market_slug"],
+            row["market_condition_id"],
+            row["outcome"],
+            row["asset_id"],
+            row["trade_count"],
+            row["trade_size"],
+            row["trade_notional"],
+        )
+        for row in rows
+    ]
+    with conn.cursor() as cur:
+        affected = cur.executemany(sql, params)
+    return int(affected or 0)
+
+
 @dataclass(frozen=True)
 class MarketBinding:
     symbol: str
@@ -94,6 +185,9 @@ class TradeVolumeWatcher:
         self.last_discovery_error: dict[str, str] = {}
         self.current_window_start_ts: int | None = None
         self.window_stats: dict[int, dict[tuple[str, str], dict[str, Any]]] = {}
+        self.db_conn = self.create_db_conn() if args.mysql_enabled else None
+        if self.db_conn is not None:
+            ensure_table(self.db_conn, args.mysql_table)
 
     def start(self) -> None:
         discovery_thread = threading.Thread(target=self.discovery_loop, daemon=True)
@@ -108,6 +202,8 @@ class TradeVolumeWatcher:
             self.ws_loop()
         finally:
             self.print_current_window_summary(force=True)
+            if self.db_conn is not None:
+                self.db_conn.close()
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -311,9 +407,10 @@ class TradeVolumeWatcher:
             return
 
         previous_summary = self.build_window_summary(previous_window_start_ts, previous_bindings, pop=True)
+        self.persist_window_summary(previous_window_start_ts, previous_summary["rows"])
         print("[window]")
         print(f"  current={self.format_market_list(current_bindings)}")
-        for line in previous_summary:
+        for line in previous_summary["lines"]:
             print(f"  {line}")
         self.current_window_start_ts = window_start_ts
 
@@ -322,16 +419,35 @@ class TradeVolumeWatcher:
         window_start_ts: int,
         bindings: dict[str, MarketBinding],
         pop: bool,
-    ) -> list[str]:
+    ) -> dict[str, list]:
         with self.stats_lock:
             stats = self.window_stats.pop(window_start_ts, {}) if pop else dict(self.window_stats.get(window_start_ts, {}))
 
         lines = [f"window={format_window_label(window_start_ts)}"]
+        rows = []
         total_count = 0
         total_size = Decimal("0")
         total_notional = Decimal("0")
 
-        symbols = sorted({binding.symbol for binding in bindings.values()})
+        ordered_bindings = sorted(bindings.values(), key=lambda item: (item.symbol, item.outcome))
+        for binding in ordered_bindings:
+            outcome_stats = stats.get((binding.symbol, binding.outcome), {})
+            rows.append(
+                {
+                    "window_start_ts": binding.market_start_ts,
+                    "window_end_ts": binding.market_end_ts,
+                    "symbol": binding.symbol,
+                    "market_slug": binding.market_slug,
+                    "market_condition_id": binding.market_condition_id,
+                    "outcome": binding.outcome,
+                    "asset_id": binding.asset_id,
+                    "trade_count": int(outcome_stats.get("count", 0)),
+                    "trade_size": str(outcome_stats.get("size", Decimal("0"))),
+                    "trade_notional": str(outcome_stats.get("notional", Decimal("0"))),
+                }
+            )
+
+        symbols = sorted({binding.symbol for binding in ordered_bindings})
         if not symbols:
             symbols = sorted({symbol for symbol, _outcome in stats})
 
@@ -358,7 +474,7 @@ class TradeVolumeWatcher:
             total_notional += symbol_notional
 
         lines.insert(1, f"all total: trades={total_count} size={format_decimal(total_size)} notional={format_decimal(total_notional)}")
-        return lines
+        return {"lines": lines, "rows": rows}
 
     def print_current_window_summary(self, force: bool) -> None:
         window_start_ts = self.current_window_start_ts
@@ -369,7 +485,7 @@ class TradeVolumeWatcher:
         summary = self.build_window_summary(window_start_ts, bindings, pop=False)
         if force:
             print("[window-final]")
-            for line in summary:
+            for line in summary["lines"]:
                 print(f"  {line}")
 
     def format_market_list(self, bindings: dict[str, MarketBinding]) -> str:
@@ -400,12 +516,31 @@ class TradeVolumeWatcher:
         except Exception as exc:  # noqa: BLE001
             print(f"[ws] {operation} failed: {exc}")
 
+    def create_db_conn(self):
+        return pymysql.connect(
+            host=self.args.mysql_host,
+            port=self.args.mysql_port,
+            user=self.args.mysql_user,
+            password=self.args.mysql_password,
+            database=self.args.mysql_database,
+            charset="utf8mb4",
+            autocommit=True,
+            cursorclass=pymysql.cursors.DictCursor,
+        )
+
+    def persist_window_summary(self, window_start_ts: int, rows: list[dict]) -> None:
+        if self.db_conn is None or not rows:
+            return
+        upsert_rows(self.db_conn, self.args.mysql_table, rows)
+        print(f"  db_written_rows={len(rows)} table={self.args.mysql_table} window_start_ts={window_start_ts}")
+
 
 def parse_args():
+    load_dotenv()
     p = argparse.ArgumentParser(
         description="Watch Polymarket 5m Up/Down trade volume for the current symbols and print a summary every 5 minutes"
     )
-    p.add_argument("--symbols", default=SYMBOLS_DEFAULT, help="Comma-separated symbols, default: doge,bnb,hype")
+    p.add_argument("--symbols", default=SYMBOLS_DEFAULT, help=f"Comma-separated symbols, default: {SYMBOLS_DEFAULT}")
     p.add_argument("--fetch-timeout-seconds", type=float, default=0.8, help="HTTP timeout per Gamma request")
     p.add_argument(
         "--refresh-interval-seconds",
@@ -414,7 +549,15 @@ def parse_args():
         help="Refresh current 5m market bindings at this interval",
     )
     p.add_argument("--ws-url", default=WS_MARKET_URL, help=f"Polymarket market websocket URL, default: {WS_MARKET_URL}")
-    return p.parse_args()
+    p.add_argument("--mysql-host", default=os.getenv("MYSQL_HOST", "127.0.0.1"))
+    p.add_argument("--mysql-port", type=int, default=int(os.getenv("MYSQL_PORT", "3306")))
+    p.add_argument("--mysql-database", default=os.getenv("MYSQL_DATABASE", ""))
+    p.add_argument("--mysql-user", default=os.getenv("MYSQL_USER", ""))
+    p.add_argument("--mysql-password", default=os.getenv("MYSQL_PASSWORD", ""))
+    p.add_argument("--mysql-table", default=os.getenv("POLYMARKET_TRADE_VOLUME_TABLE", DEFAULT_TABLE))
+    args = p.parse_args()
+    args.mysql_enabled = bool(args.mysql_database and args.mysql_user and args.mysql_password)
+    return args
 
 
 def main():
@@ -430,6 +573,9 @@ def main():
 
     print(f"symbols: {args.symbols}")
     print(f"ws_url: {args.ws_url}")
+    print(f"mysql_enabled: {args.mysql_enabled}")
+    if args.mysql_enabled:
+        print(f"mysql_table: {args.mysql_table}")
     watcher.start()
 
 
