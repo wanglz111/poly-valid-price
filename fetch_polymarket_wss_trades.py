@@ -251,8 +251,7 @@ class BatchWriter(threading.Thread):
                     continue
 
                 table = self._ensure_target_table(conn, batch[-1]["captured_at_ts"])
-                inserted = insert_rows(conn, table, batch)
-                print(f"[writer] flushed={len(batch)} inserted={inserted}")
+                insert_rows(conn, table, batch)
                 batch.clear()
                 last_flush = time.monotonic()
         finally:
@@ -272,6 +271,10 @@ class PolymarketWsTradeCollector:
         self.known_assets: dict[str, MarketBinding] = {}
         self.last_discovery_error: dict[str, str] = {}
         self.dropped_events = 0
+        self.stats_lock = threading.Lock()
+        self.window_event_counts: dict[int, dict[tuple[str, str], int]] = {}
+        self.window_drop_counts: dict[int, int] = {}
+        self.current_window_start_ts: int | None = None
         self.writer = BatchWriter(args, self.row_queue, self.stop_event)
 
     def start(self) -> None:
@@ -418,8 +421,10 @@ class PolymarketWsTradeCollector:
 
         try:
             self.row_queue.put_nowait(row)
+            self.record_window_event(binding.market_start_ts, binding.symbol, binding.outcome)
         except queue.Full:
             self.dropped_events += 1
+            self.record_window_drop(binding.market_start_ts)
             if self.dropped_events == 1 or self.dropped_events % 100 == 0:
                 print(f"[writer] queue full dropped_events={self.dropped_events}")
 
@@ -470,6 +475,8 @@ class PolymarketWsTradeCollector:
                     print(f"[gamma] {symbol} slug={slug} unavailable: {error_text}")
                     self.last_discovery_error[symbol] = error_text
 
+        self.log_window_rollover(market_start_ts, existing, desired_bindings)
+
         with self.state_lock:
             old_asset_ids = set(self.active_bindings.keys())
             self.active_bindings = desired_bindings
@@ -511,6 +518,73 @@ class PolymarketWsTradeCollector:
             print(f"[ws] {operation} asset_count={len(asset_ids)} assets={','.join(asset_ids)}")
         except Exception as exc:  # noqa: BLE001
             print(f"[ws] {operation} failed: {exc}")
+
+    def record_window_event(self, window_start_ts: int, symbol: str, outcome: str) -> None:
+        with self.stats_lock:
+            counts = self.window_event_counts.setdefault(window_start_ts, {})
+            key = (symbol, outcome)
+            counts[key] = counts.get(key, 0) + 1
+
+    def record_window_drop(self, window_start_ts: int) -> None:
+        with self.stats_lock:
+            self.window_drop_counts[window_start_ts] = self.window_drop_counts.get(window_start_ts, 0) + 1
+
+    def log_window_rollover(
+        self,
+        window_start_ts: int,
+        previous_bindings: dict[str, MarketBinding],
+        current_bindings: dict[str, MarketBinding],
+    ) -> None:
+        previous_window_start_ts = self.current_window_start_ts
+        if previous_window_start_ts is None:
+            self.current_window_start_ts = window_start_ts
+            print(f"[window] current={self.format_market_list(current_bindings)}")
+            return
+        if previous_window_start_ts == window_start_ts:
+            return
+
+        with self.stats_lock:
+            previous_counts = self.window_event_counts.pop(previous_window_start_ts, {})
+            previous_drops = self.window_drop_counts.pop(previous_window_start_ts, 0)
+
+        previous_detail = self.format_window_stats(previous_bindings, previous_counts)
+        previous_total = sum(previous_counts.values())
+        current_detail = self.format_market_list(current_bindings)
+        print("[window]")
+        print(f"  current={current_detail}")
+        print(f"  previous_window_start={previous_window_start_ts}")
+        print(f"  previous_valid={previous_total}")
+        for line in previous_detail:
+            print(f"  {line}")
+        print(f"  previous_dropped={previous_drops}")
+        self.current_window_start_ts = window_start_ts
+
+    def format_market_list(self, bindings: dict[str, MarketBinding]) -> str:
+        market_by_symbol = {}
+        for binding in bindings.values():
+            market_by_symbol[binding.symbol] = binding.market_slug
+        if not market_by_symbol:
+            return "none"
+        return ",".join(f"{symbol}:{market_by_symbol[symbol]}" for symbol in sorted(market_by_symbol))
+
+    def format_window_stats(
+        self,
+        bindings: dict[str, MarketBinding],
+        counts: dict[tuple[str, str], int],
+    ) -> list[str]:
+        symbols = sorted({binding.symbol for binding in bindings.values()})
+        if not symbols:
+            symbols = sorted({symbol for symbol, _outcome in counts})
+        if not symbols:
+            return ["previous_detail=none"]
+
+        parts = []
+        for symbol in symbols:
+            up_count = counts.get((symbol, "Up"), 0)
+            down_count = counts.get((symbol, "Down"), 0)
+            total = up_count + down_count
+            parts.append(f"{symbol}: total={total} up={up_count} down={down_count}")
+        return parts
 
 
 def parse_args():
