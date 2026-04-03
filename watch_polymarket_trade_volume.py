@@ -9,17 +9,27 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal
 from typing import Any
 
 import pymysql
 import websocket
+
+try:
+    import orjson
+except ImportError:
+    orjson = None
+
+JSON_DECODE_ERRORS = (json.JSONDecodeError,)
+if orjson is not None:
+    JSON_DECODE_ERRORS = JSON_DECODE_ERRORS + (orjson.JSONDecodeError,)
 
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 WS_MARKET_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 SYMBOLS_DEFAULT = "doge,bnb,hype,eth,btc,sol"
 HEARTBEAT_INTERVAL_SECONDS = 10.0
 DEFAULT_TABLE = "polymarket_trade_volume_windows"
+DEFAULT_DISCOVERY_IDLE_INTERVAL_SECONDS = 5.0
+DEFAULT_DISCOVERY_ACTIVE_WINDOW_SECONDS = 15.0
 
 
 def load_dotenv(path: str = ".env") -> None:
@@ -47,7 +57,21 @@ def http_json(url: str, timeout: float = 0.8):
         },
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+        return json_loads(resp.read())
+
+
+def json_loads(payload: str | bytes):
+    if orjson is not None:
+        return orjson.loads(payload)
+    if isinstance(payload, bytes):
+        payload = payload.decode("utf-8")
+    return json.loads(payload)
+
+
+def json_dumps(payload: dict[str, Any]) -> str:
+    if orjson is not None:
+        return orjson.dumps(payload).decode("utf-8")
+    return json.dumps(payload, separators=(",", ":"))
 
 
 def aligned_window_start(ts: int) -> int:
@@ -60,7 +84,7 @@ def fetch_market_by_slug(slug: str, timeout: float):
 
 def parse_json_maybe(value):
     if isinstance(value, str):
-        return json.loads(value)
+        return json_loads(value)
     return value
 
 
@@ -72,14 +96,20 @@ def parse_condition_id(market) -> str:
     raise ValueError("market payload missing condition id")
 
 
-def parse_decimal(value: Any) -> Decimal:
+def parse_float(value: Any) -> float:
     if value is None or value == "":
-        return Decimal("0")
-    return Decimal(str(value))
+        return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
-def format_decimal(value: Decimal) -> str:
-    return format(value.normalize(), "f") if value != 0 else "0"
+def format_number(value: float, places: int = 12) -> str:
+    if value == 0:
+        return "0"
+    rendered = f"{value:.{places}f}".rstrip("0").rstrip(".")
+    return rendered if rendered and rendered != "-0" else "0"
 
 
 def format_window_label(window_start_ts: int) -> str:
@@ -160,7 +190,7 @@ def upsert_rows(conn, table: str, rows: list[dict]) -> int:
     return int(affected or 0)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class MarketBinding:
     symbol: str
     market_slug: str
@@ -169,6 +199,13 @@ class MarketBinding:
     market_end_ts: int
     outcome: str
     asset_id: str
+
+
+@dataclass(slots=True)
+class AggregatedTradeStats:
+    count: int = 0
+    size: float = 0.0
+    notional: float = 0.0
 
 
 class TradeVolumeWatcher:
@@ -182,9 +219,10 @@ class TradeVolumeWatcher:
         self.ws_app: websocket.WebSocketApp | None = None
         self.active_bindings: dict[str, MarketBinding] = {}
         self.known_assets: dict[str, MarketBinding] = {}
+        self.asset_ids_snapshot: tuple[str, ...] = ()
         self.last_discovery_error: dict[str, str] = {}
         self.current_window_start_ts: int | None = None
-        self.window_stats: dict[int, dict[tuple[str, str], dict[str, Any]]] = {}
+        self.window_stats: dict[int, dict[tuple[str, str], AggregatedTradeStats]] = {}
         self.db_conn = self.create_db_conn() if args.mysql_enabled else None
         if self.db_conn is not None:
             ensure_table(self.db_conn, args.mysql_table)
@@ -226,7 +264,19 @@ class TradeVolumeWatcher:
     def discovery_loop(self) -> None:
         while not self.stop_event.is_set():
             self.refresh_current_bindings()
-            time.sleep(self.args.refresh_interval_seconds)
+            sleep_seconds = self.compute_discovery_sleep_seconds()
+            if self.stop_event.wait(sleep_seconds):
+                break
+
+    def compute_discovery_sleep_seconds(self) -> float:
+        now = time.time()
+        next_window_ts = aligned_window_start(int(now)) + 300
+        seconds_to_next_window = max(0.0, next_window_ts - now)
+        active_interval = max(0.2, self.args.refresh_interval_seconds)
+        idle_interval = max(active_interval, self.args.discovery_idle_interval_seconds)
+        if seconds_to_next_window <= self.args.discovery_active_window_seconds:
+            return active_interval
+        return min(idle_interval, seconds_to_next_window - self.args.discovery_active_window_seconds)
 
     def heartbeat_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -238,7 +288,7 @@ class TradeVolumeWatcher:
             if app is None or not app.sock or not app.sock.connected:
                 continue
             try:
-                app.send(json.dumps({}))
+                app.send(json_dumps({}))
             except Exception as exc:  # noqa: BLE001
                 print(f"[ws] heartbeat failed: {exc}")
 
@@ -268,15 +318,15 @@ class TradeVolumeWatcher:
         if not asset_ids:
             print("[ws] opened but no asset ids ready yet")
             return
-        ws.send(json.dumps({"assets_ids": asset_ids, "type": "market"}))
+        ws.send(json_dumps({"assets_ids": asset_ids, "type": "market"}))
         print(f"[ws] subscribed asset_count={len(asset_ids)}")
 
     def on_message(self, _ws, message: str):
         if message in {"PONG", "PING"}:
             return
         try:
-            payload = json.loads(message)
-        except json.JSONDecodeError:
+            payload = json_loads(message)
+        except JSON_DECODE_ERRORS:
             return
         self.handle_payload(payload)
 
@@ -287,59 +337,66 @@ class TradeVolumeWatcher:
         print(f"[ws] closed status={status_code} message={message}")
 
     def handle_payload(self, payload):
-        if isinstance(payload, list):
-            for item in payload:
-                self.handle_payload(item)
-            return
-        if not isinstance(payload, dict):
-            return
-        if str(payload.get("event_type") or "").strip() != "last_trade_price":
-            return
+        bindings = self.known_assets
+        updates: dict[tuple[int, str, str], AggregatedTradeStats] = {}
+        pending = [payload]
+        while pending:
+            item = pending.pop()
+            if isinstance(item, list):
+                pending.extend(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("event_type") or "").strip() != "last_trade_price":
+                continue
 
-        asset_id = str(payload.get("asset_id") or "")
-        binding = self.lookup_binding(asset_id)
-        if binding is None:
+            asset_id = str(item.get("asset_id") or "")
+            binding = bindings.get(asset_id)
+            if binding is None:
+                continue
+
+            trade_size = parse_float(item.get("size"))
+            trade_price = parse_float(item.get("price"))
+            key = (binding.market_start_ts, binding.symbol, binding.outcome)
+            stats = updates.get(key)
+            if stats is None:
+                stats = AggregatedTradeStats()
+                updates[key] = stats
+            stats.count += 1
+            stats.size += trade_size
+            stats.notional += trade_size * trade_price
+
+        if not updates:
             return
+        self.record_trade_batch(updates)
 
-        trade_size = parse_decimal(payload.get("size"))
-        trade_price = parse_decimal(payload.get("price"))
-        self.record_trade(binding.market_start_ts, binding.symbol, binding.outcome, trade_size, trade_price)
-
-    def record_trade(
-        self,
-        window_start_ts: int,
-        symbol: str,
-        outcome: str,
-        trade_size: Decimal,
-        trade_price: Decimal,
-    ) -> None:
+    def record_trade_batch(self, updates: dict[tuple[int, str, str], AggregatedTradeStats]) -> None:
         with self.stats_lock:
-            window = self.window_stats.setdefault(window_start_ts, {})
-            key = (symbol, outcome)
-            stats = window.setdefault(
-                key,
-                {
-                    "count": 0,
-                    "size": Decimal("0"),
-                    "notional": Decimal("0"),
-                },
-            )
-            stats["count"] += 1
-            stats["size"] += trade_size
-            stats["notional"] += trade_size * trade_price
+            for (window_start_ts, symbol, outcome), incoming in updates.items():
+                window = self.window_stats.setdefault(window_start_ts, {})
+                key = (symbol, outcome)
+                stats = window.get(key)
+                if stats is None:
+                    stats = AggregatedTradeStats()
+                    window[key] = stats
+                stats.count += incoming.count
+                stats.size += incoming.size
+                stats.notional += incoming.notional
 
     def refresh_current_bindings(self) -> None:
         now_ts = int(time.time())
         market_start_ts = aligned_window_start(now_ts)
         market_end_ts = market_start_ts + 300
 
-        with self.state_lock:
-            existing = dict(self.active_bindings)
+        existing = self.active_bindings
+        existing_by_market: dict[tuple[str, int], list[MarketBinding]] = {}
+        for binding in existing.values():
+            existing_by_market.setdefault((binding.symbol, binding.market_start_ts), []).append(binding)
 
         desired_bindings: dict[str, MarketBinding] = {}
         for symbol in self.symbols:
             slug = f"{symbol}-updown-5m-{market_start_ts}"
-            current_bindings = [b for b in existing.values() if b.symbol == symbol and b.market_start_ts == market_start_ts]
+            current_bindings = existing_by_market.get((symbol, market_start_ts), [])
             if len(current_bindings) == 2:
                 for binding in current_bindings:
                     desired_bindings[binding.asset_id] = binding
@@ -377,12 +434,18 @@ class TradeVolumeWatcher:
 
         self.log_window_rollover(market_start_ts, existing, desired_bindings)
 
+        old_asset_ids = set(existing.keys())
+        new_asset_ids = set(desired_bindings.keys())
+        retained_window_floor = market_start_ts - 300
         with self.state_lock:
-            old_asset_ids = set(self.active_bindings.keys())
             self.active_bindings = desired_bindings
-            for asset_id, binding in desired_bindings.items():
-                self.known_assets[asset_id] = binding
-            new_asset_ids = set(desired_bindings.keys())
+            retained_known_assets = {
+                asset_id: binding
+                for asset_id, binding in self.known_assets.items()
+                if binding.market_start_ts >= retained_window_floor
+            }
+            self.known_assets = {**retained_known_assets, **desired_bindings}
+            self.asset_ids_snapshot = tuple(sorted(desired_bindings))
 
         if old_asset_ids != new_asset_ids:
             removed = sorted(old_asset_ids - new_asset_ids)
@@ -426,12 +489,12 @@ class TradeVolumeWatcher:
         lines = [f"window={format_window_label(window_start_ts)}"]
         rows = []
         total_count = 0
-        total_size = Decimal("0")
-        total_notional = Decimal("0")
+        total_size = 0.0
+        total_notional = 0.0
 
         ordered_bindings = sorted(bindings.values(), key=lambda item: (item.symbol, item.outcome))
         for binding in ordered_bindings:
-            outcome_stats = stats.get((binding.symbol, binding.outcome), {})
+            outcome_stats = stats.get((binding.symbol, binding.outcome))
             rows.append(
                 {
                     "window_start_ts": binding.market_start_ts,
@@ -441,9 +504,9 @@ class TradeVolumeWatcher:
                     "market_condition_id": binding.market_condition_id,
                     "outcome": binding.outcome,
                     "asset_id": binding.asset_id,
-                    "trade_count": int(outcome_stats.get("count", 0)),
-                    "trade_size": str(outcome_stats.get("size", Decimal("0"))),
-                    "trade_notional": str(outcome_stats.get("notional", Decimal("0"))),
+                    "trade_count": outcome_stats.count if outcome_stats is not None else 0,
+                    "trade_size": format_number(outcome_stats.size if outcome_stats is not None else 0.0, places=18),
+                    "trade_notional": format_number(outcome_stats.notional if outcome_stats is not None else 0.0, places=18),
                 }
             )
 
@@ -453,27 +516,27 @@ class TradeVolumeWatcher:
 
         for symbol in symbols:
             symbol_count = 0
-            symbol_size = Decimal("0")
-            symbol_notional = Decimal("0")
+            symbol_size = 0.0
+            symbol_notional = 0.0
             for outcome in ("Up", "Down"):
-                outcome_stats = stats.get((symbol, outcome), {})
-                outcome_count = int(outcome_stats.get("count", 0))
-                outcome_size = outcome_stats.get("size", Decimal("0"))
-                outcome_notional = outcome_stats.get("notional", Decimal("0"))
+                outcome_stats = stats.get((symbol, outcome))
+                outcome_count = outcome_stats.count if outcome_stats is not None else 0
+                outcome_size = outcome_stats.size if outcome_stats is not None else 0.0
+                outcome_notional = outcome_stats.notional if outcome_stats is not None else 0.0
                 symbol_count += outcome_count
                 symbol_size += outcome_size
                 symbol_notional += outcome_notional
                 lines.append(
-                    f"{symbol} {outcome.lower()}: trades={outcome_count} size={format_decimal(outcome_size)} notional={format_decimal(outcome_notional)}"
+                    f"{symbol} {outcome.lower()}: trades={outcome_count} size={format_number(outcome_size)} notional={format_number(outcome_notional)}"
                 )
             lines.append(
-                f"{symbol} total: trades={symbol_count} size={format_decimal(symbol_size)} notional={format_decimal(symbol_notional)}"
+                f"{symbol} total: trades={symbol_count} size={format_number(symbol_size)} notional={format_number(symbol_notional)}"
             )
             total_count += symbol_count
             total_size += symbol_size
             total_notional += symbol_notional
 
-        lines.insert(1, f"all total: trades={total_count} size={format_decimal(total_size)} notional={format_decimal(total_notional)}")
+        lines.insert(1, f"all total: trades={total_count} size={format_number(total_size)} notional={format_number(total_notional)}")
         return {"lines": lines, "rows": rows}
 
     def print_current_window_summary(self, force: bool) -> None:
@@ -497,12 +560,7 @@ class TradeVolumeWatcher:
         return ",".join(f"{symbol}:{market_by_symbol[symbol]}" for symbol in sorted(market_by_symbol))
 
     def get_asset_ids(self) -> list[str]:
-        with self.state_lock:
-            return sorted(self.active_bindings.keys())
-
-    def lookup_binding(self, asset_id: str) -> MarketBinding | None:
-        with self.state_lock:
-            return self.known_assets.get(asset_id)
+        return list(self.asset_ids_snapshot)
 
     def send_subscription_update(self, operation: str, asset_ids: list[str]) -> None:
         if not asset_ids:
@@ -512,7 +570,7 @@ class TradeVolumeWatcher:
         if app is None or not app.sock or not app.sock.connected:
             return
         try:
-            app.send(json.dumps({"operation": operation, "assets_ids": asset_ids}))
+            app.send(json_dumps({"operation": operation, "assets_ids": asset_ids}))
         except Exception as exc:  # noqa: BLE001
             print(f"[ws] {operation} failed: {exc}")
 
@@ -525,7 +583,7 @@ class TradeVolumeWatcher:
             database=self.args.mysql_database,
             charset="utf8mb4",
             autocommit=True,
-            cursorclass=pymysql.cursors.DictCursor,
+            cursorclass=pymysql.cursors.Cursor,
         )
 
     def persist_window_summary(self, window_start_ts: int, rows: list[dict]) -> None:
@@ -546,7 +604,19 @@ def parse_args():
         "--refresh-interval-seconds",
         type=float,
         default=0.5,
-        help="Refresh current 5m market bindings at this interval",
+        help="Refresh current 5m market bindings at this interval near window rollover",
+    )
+    p.add_argument(
+        "--discovery-idle-interval-seconds",
+        type=float,
+        default=DEFAULT_DISCOVERY_IDLE_INTERVAL_SECONDS,
+        help="Refresh current 5m market bindings at this interval away from window rollover",
+    )
+    p.add_argument(
+        "--discovery-active-window-seconds",
+        type=float,
+        default=DEFAULT_DISCOVERY_ACTIVE_WINDOW_SECONDS,
+        help="Use the faster refresh interval for this many seconds before the next 5m window begins",
     )
     p.add_argument("--ws-url", default=WS_MARKET_URL, help=f"Polymarket market websocket URL, default: {WS_MARKET_URL}")
     p.add_argument("--mysql-host", default=os.getenv("MYSQL_HOST", "127.0.0.1"))
